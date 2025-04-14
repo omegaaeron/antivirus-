@@ -1,0 +1,184 @@
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <vector>
+#include <string>
+#include <sqlite3.h>
+#include <openssl/sha.h>
+#include <filesystem>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+// Liste des "signatures" de virus
+const std::vector<std::string> VIRUS_SIGNATURES = {
+    "malware_signature_123",
+    "virus_code_xyz",
+    "trojan_injection_abc"
+};
+
+// Fonction pour calculer le hash SHA-256 d'un fichier
+std::string calculateFileHash(const std::string& filePath) {
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[ERREUR] Impossible d'ouvrir le fichier : " << filePath << std::endl;
+        return "";
+    }
+
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+
+    char buffer[4096];
+    while (file.read(buffer, sizeof(buffer))) {
+        SHA256_Update(&sha256, buffer, file.gcount());
+    }
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash, &sha256);
+
+    std::ostringstream oss;
+    for (unsigned char c : hash) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+    }
+
+    return oss.str();
+}
+
+// Fonction pour exécuter une requête SQL sans résultat
+void executeSQL(sqlite3* db, const std::string& sql) {
+    char* errorMessage = nullptr;
+    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errorMessage) != SQLITE_OK) {
+        std::cerr << "[ERREUR] Erreur SQL : " << errorMessage << std::endl;
+        sqlite3_free(errorMessage);
+    }
+}
+
+// Fonction pour scanner un fichier
+bool scanFile(sqlite3* db, const std::string& filePath) {
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        std::cerr << "[ERREUR] Impossible d'ouvrir le fichier : " << filePath << std::endl;
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    bool isInfected = false;
+
+    for (const auto& signature : VIRUS_SIGNATURES) {
+        if (content.find(signature) != std::string::npos) {
+            std::cout << "[ALERTE] Virus détecté dans le fichier : " << filePath << std::endl;
+            isInfected = true;
+            break;
+        }
+    }
+
+    // Insérer les résultats dans la base de données
+    std::string sql = "INSERT INTO scanned_files (file_name, file_path, virus_detected) VALUES ('" +
+                      fs::path(filePath).filename().string() + "', '" + filePath + "', " +
+                      (isInfected ? "1" : "0") + ");";
+    executeSQL(db, sql);
+
+    return isInfected;
+}
+
+// Fonction pour scanner un répertoire
+void scanDirectory(sqlite3* db, const std::string& directoryPath) {
+    for (const auto& entry : fs::recursive_directory_iterator(directoryPath)) {
+        if (entry.is_regular_file()) {
+            scanFile(db, entry.path().string());
+        }
+    }
+}
+
+// Fonction pour rechercher un fichier scanné
+void searchFile(sqlite3* db, const std::string& fileName) {
+    std::string sql = "SELECT * FROM scanned_files WHERE file_name LIKE '%" + fileName + "%';";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "[ERREUR] Impossible de préparer la requête SQL : " << sqlite3_errmsg(db) << std::endl;
+        return;
+    }
+
+    std::cout << "Résultats de la recherche : " << std::endl;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::cout << "ID : " << sqlite3_column_int(stmt, 0)
+                  << ", Nom : " << sqlite3_column_text(stmt, 1)
+                  << ", Chemin : " << sqlite3_column_text(stmt, 2)
+                  << ", Virus détecté : " << (sqlite3_column_int(stmt, 3) ? "Oui" : "Non")
+                  << ", Date : " << sqlite3_column_text(stmt, 4) << std::endl;
+    }
+
+    sqlite3_finalize(stmt);
+}
+
+// Fonction pour générer un rapport des fichiers infectés
+void generateReport(sqlite3* db) {
+    std::string sql = "SELECT * FROM scanned_files WHERE virus_detected = 1;";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "[ERREUR] Impossible de préparer la requête SQL : " << sqlite3_errmsg(db) << std::endl;
+        return;
+    }
+
+    std::cout << "Rapport des fichiers infectés : " << std::endl;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::cout << "ID : " << sqlite3_column_int(stmt, 0)
+                  << ", Nom : " << sqlite3_column_text(stmt, 1)
+                  << ", Chemin : " << sqlite3_column_text(stmt, 2)
+                  << ", Date : " << sqlite3_column_text(stmt, 4) << std::endl;
+    }
+
+    sqlite3_finalize(stmt);
+}
+
+int main() {
+    sqlite3* db;
+    if (sqlite3_open("antivirus.db", &db)) {
+        std::cerr << "[ERREUR] Impossible d'ouvrir la base de données : " << sqlite3_errmsg(db) << std::endl;
+        return 1;
+    }
+
+    // Créer la table si elle n'existe pas
+    std::string createTableSQL = R"(
+        CREATE TABLE IF NOT EXISTS scanned_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            virus_detected INTEGER NOT NULL,
+            scan_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    )";
+    executeSQL(db, createTableSQL);
+
+    int choix;
+    do {
+        std::cout << "\n=== Menu Antivirus ===" << std::endl;
+        std::cout << "1. Scanner un répertoire" << std::endl;
+        std::cout << "2. Rechercher un fichier scanné" << std::endl;
+        std::cout << "3. Générer un rapport des fichiers infectés" << std::endl;
+        std::cout << "4. Quitter" << std::endl;
+        std::cout << "Entrez votre choix : ";
+        std::cin >> choix;
+
+        if (choix == 1) {
+            std::cin.ignore();
+            std::string directoryPath;
+            std::cout << "Entrez le chemin du répertoire à scanner : ";
+            std::getline(std::cin, directoryPath);
+            scanDirectory(db, directoryPath);
+        } else if (choix == 2) {
+            std::cin.ignore();
+            std::string fileName;
+            std::cout << "Entrez le nom du fichier à rechercher : ";
+            std::getline(std::cin, fileName);
+            searchFile(db, fileName);
+        } else if (choix == 3) {
+            generateReport(db);
+        }
+    } while (choix != 4);
+
+    sqlite3_close(db);
+    return 0;
+}
